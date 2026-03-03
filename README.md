@@ -1,74 +1,131 @@
 # AD-LoRa-CSV-ingestion-service
 
-A FastAPI microservice that accepts CSV uploads containing LoRaWAN device
-credentials and automatically registers them in ChirpStack via its REST API.
+FastAPI service for uploading LoRaWAN CSV credentials and provisioning devices in ChirpStack with tracked import jobs.
 
-## Features
+## What Changed
 
-- **POST /upload** -- upload a CSV file of device credentials; the service
-  validates the file, saves it, and spawns an asynchronous job that registers
-  each device in ChirpStack.
-- **GET /healthz** -- lightweight health-check endpoint.
-- Bearer-token authentication on the upload endpoint.
+- Profile-aware key upload:
+  - LoRaWAN 1.0.x device profiles use `appKey`
+  - LoRaWAN 1.1 profiles use `nwkKey`
+- Ingest logic is callable as Python (`ingest_csv`) and still executable as a CLI script.
+- Uploads create persistent jobs in SQLite with status and metrics.
+- API now includes:
+  - `POST /upload`
+  - `GET /jobs/{job_id}`
+  - `GET /jobs?limit=&offset=`
+  - `GET /healthz`
+- Upload validation hardening:
+  - CSV-only uploads
+  - required headers validation (BOM/whitespace-safe)
+  - configurable payload limit (`MAX_UPLOAD_BYTES`, default 10 MiB)
 
-## CSV Format
+## CSV Requirements
 
-The uploaded CSV must contain these columns:
+Required columns:
 
-| Column   | Description                         | Example                            |
-|----------|-------------------------------------|------------------------------------|
-| DEVEUI   | Device EUI (16 hex chars / 8 bytes) | `c93b87ffffee0ddf`                 |
-| APPEUI   | Application EUI                     | `70b3d57ed0026b87`                 |
-| APPKEY   | Application Key (32 hex chars)      | `2b7e151628aed2a6abf7c93b87ee0ddf` |
-| DEVADDR  | Device Address                      | `42496b13`                         |
-| NWKSKEY  | Network Session Key                 | (hex string)                       |
-| APPSKEY  | App Session Key                     | (hex string)                       |
-
-## Quick Start
-
-```bash
-# Clone and enter
-git clone <your-repo-url>
-cd AD-LoRa-CSV-ingestion-service
-
-# Create and activate virtual environment
-python3 -m venv venv
-source venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Configure environment (copy and edit)
-cp .env.example .env
-# Edit .env with your real values
-
-# Run the service
-uvicorn ingest.ingestion_api:app --host 0.0.0.0 --port 8000
-```
+- `DEVEUI`
+- `APPEUI`
+- `APPKEY`
+- `DEVADDR`
+- `NWKSKEY`
+- `APPSKEY`
 
 ## Environment Variables
 
-| Variable              | Required | Default                     | Description                      |
-|-----------------------|----------|-----------------------------|----------------------------------|
-| CHIRPSTACK_API_URL    | No       | `http://localhost:8090/api` | ChirpStack REST API base URL     |
-| CHIRPSTACK_API_TOKEN  | Yes      |                             | ChirpStack API bearer token      |
-| INGEST_API_TOKEN      | Yes      |                             | Token for authenticating uploads |
-| APPLICATION_ID        | Yes      |                             | ChirpStack application UUID      |
-| LW010_PROFILE_ID      | Yes      |                             | Device profile UUID for LW010    |
-| UPLOAD_DIR            | No       | `./uploads` (relative)      | Directory for uploaded CSV files |
+See `.env.example` for a complete template.
 
-## Usage
+- `CHIRPSTACK_API_URL` (`http://chirpstack:8080/api` in Docker)
+- `CHIRPSTACK_API_TOKEN`
+- `INGEST_API_TOKEN` (required for API auth)
+- `APPLICATION_ID` (ChirpStack **application UUID**)
+- `DEVICE_PROFILE_ID` (ChirpStack **device profile UUID**)
+- `LW010_PROFILE_ID` (legacy fallback)
+- `UPLOAD_DIR` (default `/opt/chirpstack-ingest/uploads`)
+- `DB_PATH` (default `/opt/chirpstack-ingest/jobs.db`)
+- `MAX_UPLOAD_BYTES` (default `10485760`)
+
+## Local Run
 
 ```bash
-curl -X POST http://localhost:8000/upload \
-  -H "Authorization: Bearer <INGEST_API_TOKEN>" \
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+uvicorn ingest.ingestion_api:app --host 127.0.0.1 --port 8000
+```
+
+## Docker / Compose
+
+Use `docker-compose.ingest.yml` as a drop-in service snippet for a ChirpStack stack.
+
+```bash
+docker compose -f docker-compose.ingest.yml up -d ingest-api
+```
+
+The service binds to `127.0.0.1:8000` so it is only reachable via local reverse proxy (for example NGINX).
+
+## API Examples
+
+Upload a CSV:
+
+```bash
+curl -X POST http://127.0.0.1:8000/upload \
+  -H "Authorization: Bearer ${INGEST_API_TOKEN}" \
   -F "file=@devices.csv"
 ```
 
 Response:
 
 ```json
-{"job_id": "5374eb81-c80d-498d-baf6-996089c45f41", "status": "accepted"}
+{"job_id":"<uuid>","status":"queued"}
 ```
 
-Processing logs are written to `uploads/<job_id>.csv.log`.
+Check job status:
+
+```bash
+curl -H "Authorization: Bearer ${INGEST_API_TOKEN}" \
+  http://127.0.0.1:8000/jobs/<job_id>
+```
+
+List jobs:
+
+```bash
+curl -H "Authorization: Bearer ${INGEST_API_TOKEN}" \
+  "http://127.0.0.1:8000/jobs?limit=20&offset=0"
+```
+
+## NGINX HTTPS Hardening Example
+
+```nginx
+limit_req_zone $binary_remote_addr zone=ingest_limit:10m rate=10r/m;
+
+server {
+    listen 443 ssl http2;
+    server_name ingest.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/ingest.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/ingest.example.com/privkey.pem;
+
+    client_max_body_size 10m;
+
+    location / {
+        limit_req zone=ingest_limit burst=20 nodelay;
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}
+
+server {
+    listen 80;
+    server_name ingest.example.com;
+    return 301 https://$host$request_uri;
+}
+```
+
+## Tests
+
+```bash
+pytest
+```
+
+Coverage includes key selection, hex normalization, and API bad-payload/auth behavior.

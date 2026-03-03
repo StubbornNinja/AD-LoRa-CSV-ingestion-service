@@ -1,392 +1,265 @@
-ontext
-The repo AD-LoRa-CSV-ingestion-service has all its source code isolated inside a chirpstack-ingest/ subdirectory. The repo root only contains a 2-line README.md. This plan promotes the source code to the root, fixes bugs, adds proper project scaffolding, and deletes the subdirectory.
-Current structure:
-AD-LoRa-CSV-ingestion-service/
-├── README.md                  (2-line placeholder — only tracked file)
-└── chirpstack-ingest/         (untracked — ALL code lives here)
-    ├── .env                   (real secrets — DO NOT commit)
-    ├── ingest/
-    │   ├── ingestion_api.py   (FastAPI API — has hardcoded path + file handle leak)
-    │   └── csv_to_chirpstack.py (CSV parser + ChirpStack device registration)
-    ├── uploads/               (test CSVs + logs)
-    └── venv/                  (Python 3.11 virtualenv)
-Target structure:
-AD-LoRa-CSV-ingestion-service/
-├── .gitignore
-├── .env.example               (placeholder values, safe to commit)
-├── README.md                  (real documentation)
-├── requirements.txt           (pinned deps)
-├── ingest/
-│   ├── __init__.py
-│   ├── ingestion_api.py       (fixed: relative path, file handle leak)
-│   └── csv_to_chirpstack.py   (copied verbatim)
-└── uploads/
-    └── .gitkeep
+Enhance the existing AD-LoRa-CSV-ingestion-service to production readiness. This includes making the CSV ingestion correct for ChirpStack LoRaWAN profiles, adding job tracking, improving API stability, containerizing the service, hardening for HTTPS exposure, and enabling future expansion (multi-profile / ABP support).
 
-Issues Found & Fixes
-#IssueFix1All code isolated in chirpstack-ingest/ subdirectoryMove ingest/ to repo root2No .gitignore — .DS_Store, venv/, __pycache__/, .env exposedCreate .gitignore3Real secrets (JWT tokens, API keys) in .envCreate .env.example with placeholders; .gitignore the real .env4No requirements.txt — deps only in venvCreate requirements.txt from venv packages5Hardcoded path /opt/chirpstack-ingest/ingest/csv_to_chirpstack.py in ingestion_api.py:44Use pathlib.Path(__file__).resolve().parent for dynamic resolution6Hardcoded default /opt/chirpstack-ingest/uploads in ingestion_api.py:8Default to BASE_DIR.parent / "uploads" (relative to source)7File handle leak — stdout=open(...) never closed in ingestion_api.py:48Wrap in with open(...) as log_fh8No __init__.py in ingest/ packageAdd ingest/__init__.py9Test CSV data + logs in uploads/ shouldn't be tracked.gitignore upload data; use .gitkeep for the directory10README.md is a placeholderRewrite with usage docs, env var table, CSV format
+Scope of Work
+1) Correct Key Handling Based on Device Profile
 
-Steps (with exact file contents)
-Step 1: Create .gitignore at repo root
-gitignore# Environment & secrets
-.env
-venv/
-.venv/
+Problem:
+The current script sends nwkKey unconditionally. ChirpStack v4 with LoRaWAN 1.0.x profiles requires appKey. Without this, device key uploads fail.
 
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-*.egg-info/
-dist/
-build/
+Tasks:
 
-# OS
-.DS_Store
-Thumbs.db
+Replace hardcoded nwkKey with profile-aware logic:
 
-# Upload data (created at runtime)
-uploads/*.csv
-uploads/*.log
+Detect MAC version from the configured profile (via ChirpStack API).
 
-# IDE
-.vscode/
-.idea/
+Use appKey for LoRaWAN 1.0.x profiles.
 
-# Old subdirectory (safety net during migration)
-chirpstack-ingest/
-```
+Use nwkKey for LoRaWAN 1.1 profiles.
 
----
+Acceptance Criteria:
 
-### Step 2: Create `requirements.txt` at repo root
+Unit tests for key field selection.
 
-Derived from venv — direct dependencies only (transitive deps pulled automatically by pip):
-```
-fastapi==0.128.0
-uvicorn==0.40.0
-requests==2.32.5
-python-multipart==0.0.21
-pydantic==2.12.5
+When using a LW010_PROFILE_ID, script posts {"appKey": "..."}
 
-Step 3: Create .env.example at repo root
-bash# ChirpStack REST API
-CHIRPSTACK_API_URL=http://localhost:8090/api
-CHIRPSTACK_API_TOKEN=your-chirpstack-api-token-here
+When using a LoRaWAN 1.1 profile, script posts {"nwkKey": "..."}
 
-# Ingest service auth
-INGEST_API_TOKEN=your-ingest-api-token-here
+Manual CSV import via API + NGINX results in devices with correct keys in ChirpStack.
 
-# Upload directory (absolute path; defaults to ./uploads relative to app)
-UPLOAD_DIR=./uploads
+2) Refactor Ingest Logic to Return Structured Results
 
-# Default target application for imported devices
-APPLICATION_ID=your-application-id-here
+Problem:
+Right now, the API just spawns a subprocess and returns “accepted” without results.
 
-# Device Profile ID for LW010
-LW010_PROFILE_ID=your-device-profile-id-here
+Tasks:
 
-Step 4: Create ingest/__init__.py
-python"""ChirpStack CSV ingestion service."""
+Refactor csv_to_chirpstack.py into functions callable from Python:
 
-Step 5: Create fixed ingest/ingestion_api.py
-This is the fixed version of chirpstack-ingest/ingest/ingestion_api.py. Three bugs are fixed:
+ingest_csv(application_id, csv_path, profile_id)
 
-Hardcoded script path → pathlib-based resolution
-Hardcoded UPLOAD_DIR default → relative to source file
-File handle leak → with block
+Return structured result object:
 
-pythonimport os
-import uuid
-import subprocess
-from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, Header, HTTPException
-from fastapi.responses import JSONResponse
-
-# Resolve paths relative to this file's location
-BASE_DIR = Path(__file__).resolve().parent
-CSV_SCRIPT = BASE_DIR / "csv_to_chirpstack.py"
-
-INGEST_API_TOKEN = os.getenv("INGEST_API_TOKEN")
-UPLOAD_DIR = os.getenv("UPLOAD_DIR", str(BASE_DIR.parent / "uploads"))
-APPLICATION_ID = os.getenv("APPLICATION_ID")
-
-if not INGEST_API_TOKEN:
-    raise RuntimeError("INGEST_API_TOKEN not set")
-if not APPLICATION_ID:
-    raise RuntimeError("APPLICATION_ID not set")
-
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-app = FastAPI(title="ChirpStack CSV Ingest")
-
-
-@app.get("/healthz")
-def healthz():
-    return {"ok": True}
-
-
-@app.post("/upload")
-async def upload_csv(
-    file: UploadFile = File(...),
-    authorization: str = Header(None),
-):
-    if authorization != f"Bearer {INGEST_API_TOKEN}":
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    if not file.filename.lower().endswith(".csv"):
-        raise HTTPException(status_code=400, detail="CSV only")
-
-    job_id = str(uuid.uuid4())
-    dest = os.path.join(UPLOAD_DIR, f"{job_id}.csv")
-
-    with open(dest, "wb") as out:
-        out.write(await file.read())
-
-    # Run the CSV-to-ChirpStack script against the uploaded file.
-    # Open the log file inside a with-statement so the handle is properly closed
-    # in the parent process. The child process inherits a copy of the fd.
-    log_path = f"{dest}.log"
-    with open(log_path, "w") as log_fh:
-        subprocess.Popen(
-            ["python3", str(CSV_SCRIPT), APPLICATION_ID, dest],
-            stdout=log_fh,
-            stderr=subprocess.STDOUT,
-        )
-
-    return JSONResponse({"job_id": job_id, "status": "accepted"})
-
-Step 6: Copy ingest/csv_to_chirpstack.py verbatim
-Copy chirpstack-ingest/ingest/csv_to_chirpstack.py to ingest/csv_to_chirpstack.py with no modifications. This file uses environment variables for all config and takes CLI args — no hardcoded paths.
-Source file contents for reference (copy as-is):
-python#!/usr/bin/env python3
-
-import csv
-import os
-import sys
-import requests
-
-CHIRPSTACK_API_URL = os.getenv("CHIRPSTACK_API_URL", "http://localhost:8090/api")
-API_TOKEN = os.getenv("CHIRPSTACK_API_TOKEN")
-
-if not API_TOKEN:
-    print("ERROR: CHIRPSTACK_API_TOKEN not set")
-    sys.exit(1)
-
-LW010_PROFILE_ID = os.getenv("LW010_PROFILE_ID")
-
-if not LW010_PROFILE_ID:
-    print("ERROR: LW010_PROFILE_ID not set")
-    sys.exit(1)
-
-HEADERS = {
-    "Authorization": f"Bearer {API_TOKEN}",
-    "Content-Type": "application/json",
+{
+  ok: int,
+  skipped: int,
+  failed: int,
+  errors: [ ... ],
 }
 
-REQUIRED_COLUMNS = ["DEVEUI", "APPEUI", "APPKEY", "DEVADDR", "NWKSKEY", "APPSKEY"]
+Acceptance Criteria:
 
-def normalize_hex(value: str) -> str:
-    v = (value or "").strip().lower()
-    if v.startswith("0x"):
-        v = v[2:]
-    return v
+Subprocess mode still works unchanged.
 
-def validate_row(row: dict, rownum: int) -> None:
-    missing = [c for c in REQUIRED_COLUMNS if c not in row]
-    if missing:
-        raise ValueError(f"Row {rownum}: missing columns {missing}")
+API can import and call ingest_csv() directly without spawning a new process.
 
-    dev_eui = normalize_hex(row["DEVEUI"])
-    appkey = normalize_hex(row["APPKEY"])
+3) Add Job Tracking Endpoints
 
-    if len(dev_eui) != 16:
-        raise ValueError(f"Row {rownum}: DEVEUI must be 16 hex chars (8 bytes), got '{row['DEVEUI']}'")
-    if len(appkey) != 32:
-        raise ValueError(f"Row {rownum}: APPKEY must be 32 hex chars (16 bytes), got '{row['APPKEY']}'")
+Problem:
+Clients can upload but cannot know import success or failure.
 
-def device_exists(dev_eui: str) -> bool:
-    r = requests.get(f"{CHIRPSTACK_API_URL}/devices/{dev_eui}", headers=HEADERS)
-    return r.status_code == 200
+Tasks:
 
-def create_device(application_id: str, dev_eui: str) -> None:
-    payload = {
-      "device": {
-        "applicationId": application_id,
-        "deviceProfileId": LW010_PROFILE_ID,
-        "devEui": dev_eui,
-        "name": dev_eui,
-        "description": "Imported via CSV",
-        "isDisabled": False,
-        "skipFcntCheck": False,
-      }
-    }
-    r = requests.post(f"{CHIRPSTACK_API_URL}/devices", headers=HEADERS, json=payload)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(r.text)
+Create a SQLite (or JSON) job store under /opt/chirpstack-ingest/jobs.db with schema:
 
-def set_device_keys(dev_eui: str, appkey: str) -> None:
-    payload = {
-        "deviceKeys": {
-            "devEui": dev_eui,
-            "nwkKey": appkey,
-        }
-    }
-    r = requests.post(f"{CHIRPSTACK_API_URL}/devices/{dev_eui}/keys", headers=HEADERS, json=payload)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(r.text)
+job_id (PK), status, created_at, started_at, finished_at, ok, skipped, failed, log_path
 
-def ingest_csv(application_id: str, csv_path: str) -> int:
-    ok = 0
-    fail = 0
+API additions:
 
-    with open(csv_path, newline="") as f:
-        reader = csv.DictReader(f)
+POST /upload → creates job entry and returns job_id
 
-        for i, row in enumerate(reader, start=2):  # header is line 1
-            try:
-                validate_row(row, i)
-                dev_eui = normalize_hex(row["DEVEUI"])
-                appkey = normalize_hex(row["APPKEY"])
+GET /jobs/{job_id} → returns job status + metrics
 
-                if device_exists(dev_eui):
-                    print(f"[SKIP] {dev_eui} already exists")
-                    continue
+GET /jobs → paginated summary
 
-                create_device(application_id, dev_eui)
-                set_device_keys(dev_eui, appkey)
+Acceptance Criteria:
 
-                print(f"[OK] {dev_eui}")
-                ok += 1
-            except Exception as e:
-                print(f"[ERROR] line {i}: {e}")
-                fail += 1
+API formal job status tracking implemented.
 
-    print(f"Done. ok={ok} fail={fail}")
-    return 0 if fail == 0 else 2
+Upload returns { job_id, status }
 
-if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print("Usage: csv_to_chirpstack.py <APPLICATION_ID> <CSV_FILE>")
-        sys.exit(1)
+Querying a completed job yields detailed results and links/log content.
 
-    sys.exit(ingest_csv(sys.argv[1], sys.argv[2]))
+4) Improve Upload Handling & Validation
 
-Step 7: Create uploads/.gitkeep
-Create an empty file at uploads/.gitkeep. This ensures git tracks the uploads/ directory while .gitignore excludes runtime data (*.csv, *.log).
+Tasks:
 
-Step 8: Rewrite README.md
-Replace the current 2-line placeholder with:
-markdown# AD-LoRa-CSV-ingestion-service
+Reject non-CSV content early with 400 errors.
 
-A FastAPI microservice that accepts CSV uploads containing LoRaWAN device
-credentials and automatically registers them in ChirpStack via its REST API.
+Limit upload size (configurable but safe, e.g., 10 MB).
 
-## Features
+Strong CSV header validation (required columns must be present, fail fast).
 
-- **POST /upload** -- upload a CSV file of device credentials; the service
-  validates the file, saves it, and spawns an asynchronous job that registers
-  each device in ChirpStack.
-- **GET /healthz** -- lightweight health-check endpoint.
-- Bearer-token authentication on the upload endpoint.
+Strip BOM / whitespace in headers.
 
-## CSV Format
+Acceptance Criteria:
 
-The uploaded CSV must contain these columns:
+Invalid payloads return correct 4xx errors.
 
-| Column   | Description                         | Example                            |
-|----------|-------------------------------------|------------------------------------|
-| DEVEUI   | Device EUI (16 hex chars / 8 bytes) | `c93b87ffffee0ddf`                 |
-| APPEUI   | Application EUI                     | `70b3d57ed0026b87`                 |
-| APPKEY   | Application Key (32 hex chars)      | `2b7e151628aed2a6abf7c93b87ee0ddf` |
-| DEVADDR  | Device Address                      | `42496b13`                         |
-| NWKSKEY  | Network Session Key                 | (hex string)                       |
-| APPSKEY  | App Session Key                     | (hex string)                       |
+CSV issues return structured error messages.
 
-## Quick Start
-```bash
-# Clone and enter
-git clone 
-cd AD-LoRa-CSV-ingestion-service
+Excessively large files are rejected (API and NGINX should both enforce).
 
-# Create and activate virtual environment
-python3 -m venv venv
-source venv/bin/activate
+5) Containerize the API Service
 
-# Install dependencies
-pip install -r requirements.txt
+Goals:
 
-# Configure environment (copy and edit)
-cp .env.example .env
-# Edit .env with your real values
+Dockerfile for ingestion API
 
-# Run the service
-uvicorn ingest.ingestion_api:app --host 0.0.0.0 --port 8000
-```
+Integrate into ChirpStack Docker Compose stack
 
-## Environment Variables
+Ensure automatic restart and network connectivity
 
-| Variable              | Required | Default                     | Description                      |
-|-----------------------|----------|-----------------------------|----------------------------------|
-| CHIRPSTACK_API_URL    | No       | `http://localhost:8090/api` | ChirpStack REST API base URL     |
-| CHIRPSTACK_API_TOKEN  | Yes      |                             | ChirpStack API bearer token      |
-| INGEST_API_TOKEN      | Yes      |                             | Token for authenticating uploads |
-| APPLICATION_ID        | Yes      |                             | ChirpStack application UUID      |
-| LW010_PROFILE_ID      | Yes      |                             | Device profile UUID for LW010    |
-| UPLOAD_DIR            | No       | `./uploads` (relative)      | Directory for uploaded CSV files |
+Deliverables:
 
-## Usage
-```bash
-curl -X POST http://localhost:8000/upload \
-  -H "Authorization: Bearer " \
-  -F "file=@devices.csv"
-```
+/ingest/Dockerfile
 
-Response:
-```json
-{"job_id": "5374eb81-c80d-498d-baf6-996089c45f41", "status": "accepted"}
-```
+Updated docker-compose.yml snippet
 
-Processing logs are written to `uploads/<job_id>.csv.log`.
+Updated .env.example
 
-Step 9: Delete chirpstack-ingest/ directory
-IMPORTANT: Before deletion, the user must save the real secret values from chirpstack-ingest/.env somewhere safe (password manager, notes, etc.) so they can populate the new root-level .env from .env.example. The secrets are:
+Volumes configured for:
 
-CHIRPSTACK_API_TOKEN (JWT)
-INGEST_API_TOKEN
-APPLICATION_ID
-LW010_PROFILE_ID
+/uploads
 
-Then:
-bashrm -rf chirpstack-ingest/
-Since chirpstack-ingest/ was never tracked by git (only README.md was committed), this is a clean removal with no git history concerns.
+/jobs.db
 
-Step 10: Stage and commit
-Use explicit file names (not git add . or git add -A) to avoid accidentally staging .DS_Store or .env:
-bashgit add .gitignore requirements.txt .env.example \
-       ingest/__init__.py ingest/ingestion_api.py ingest/csv_to_chirpstack.py \
-       uploads/.gitkeep README.md
+Details:
 
-git commit -m "Restructure: promote chirpstack-ingest to repo root
+Bind to 127.0.0.1:8000 so only NGINX is exposed publicly.
 
-- Move ingest/ source from chirpstack-ingest/ subdirectory to repo root
-- Fix hardcoded /opt/chirpstack-ingest/ paths to use pathlib-based resolution
-- Fix subprocess file handle leak in ingestion_api.py
-- Add .gitignore, requirements.txt, .env.example, ingest/__init__.py
-- Add uploads/.gitkeep for runtime upload directory
-- Rewrite README.md with usage documentation
-- Remove chirpstack-ingest/ subdirectory"
+Use restart: unless-stopped so it auto-starts after VM reboot.
 
-Verification
+Docker networking allows “chirpstack” service DNS access to ChirpStack API.
 
-Structure check: tree -a -I '.git|venv|__pycache__' confirms target layout
-Syntax check: python3 -c "import ast; ast.parse(open('ingest/ingestion_api.py').read()); ast.parse(open('ingest/csv_to_chirpstack.py').read()); print('OK')"
-Import check: With venv active and deps installed: python3 -c "from ingest.ingestion_api import app; print(app.title)" should print ChirpStack CSV Ingest
-Git status: git status should show only tracked files — no .env, .DS_Store, or __pycache__/
+Acceptance Criteria:
 
+Service runs via docker compose up -d ingest-api
 
-Future Work
+Exposed uploads API reachable only via localhost through NGINX
 
-Dockerfile + .dockerignore — Add containerization support (the service is described as part of a Docker stack)
-Job status endpoint — The current design is fire-and-forget (Popen without checking exit code). A /jobs/{job_id} endpoint could read the .csv.log file and return status
-Structured logging — Replace print() statements with Python logging module
+Logs persist between container restarts
+
+6) Update Documentation and Env Examples
+
+Tasks:
+
+Update README.md and .env.example:
+
+Clarify meaning of APPLICATION_ID (uuid vs numeric)
+
+Add INGEST_API_TOKEN
+
+Add UPLOAD_DIR, DB_PATH
+
+Show Docker Compose example
+
+Example curl usage with status endpoint
+
+Acceptance Criteria:
+
+Repository README accurately reflects production setup
+
+.env.example provides a usable starting template
+
+7) Security & Hardening
+
+Tasks:
+
+Ensure secrets are not logged (API tokens, keys)
+
+Use proper file permissions on volumes and env files
+
+NGINX must enforce:
+
+Rate limiting
+
+Request size limit
+
+TLS only
+
+Acceptance Criteria:
+
+No sensitive values in stdout/stderr logs
+
+API rejects unauthorized requests reliably
+
+System is safe for public exposure via HTTPS
+
+8) Optional Future Enhancements
+
+These are not blocking, but should be scoped if resources permit:
+
+A) Support ABP provisioning
+
+Add a CSV column like MODE, ABP, or detect if ABP fields are present
+
+Implement ABP activation logic via ChirpStack API
+
+Provide per-row provisioning strategy
+
+B) Multi-profile CSV support
+
+Allow a column like PROFILE_CODE that maps to env vars
+
+Maintain a profile mapping in config
+
+C) Dry-run API
+
+Return validation errors without writing or posting to ChirpStack
+
+Testing & Verification
+Manual Testing
+
+Upload a valid CSV via curl POST /upload with auth header.
+
+Poll GET /jobs/{job_id} until completion.
+
+Verify devices appear in ChirpStack UI with correct profiles and keys.
+
+Edge Cases
+
+Missing columns → 400 error
+
+Duplicate devices → skipped
+
+Invalid hex values → recorded as errors, job does not crash
+
+Mixed valid/invalid rows → partial success documented
+
+CI Tests (Suggested)
+
+Fixture CSVs (good, bad, mix)
+
+Unit tests for:
+
+normalize_hex()
+
+profile key selection logic
+
+API responses for bad payloads
+
+End-to-end tests with local ChirpStack test instance (Docker)
+
+Deliverable Artifacts
+
+Updated Python scripts (csv_to_chirpstack.py, ingestion_api.py)
+
+New SQLite job tracking code
+
+Dockerfile and Compose config
+
+Updated docs (README.md, CODEX_PLAN.md, .env.example)
+
+Unit tests
+
+API usage examples
+
+Milestones
+
+CSV ingest correctness & key handling
+
+API structural improvements + job tracking
+
+Containerization + Docker Compose integration
+
+Documentation + production hardening

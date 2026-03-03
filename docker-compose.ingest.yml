@@ -1,0 +1,19 @@
+services:
+  ingest-api:
+    build:
+      context: .
+      dockerfile: ingest/Dockerfile
+    env_file:
+      - .env
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./uploads:/opt/chirpstack-ingest/uploads
+      - ./jobs.db:/opt/chirpstack-ingest/jobs.db
+    networks:
+      - chirpstack
+
+networks:
+  chirpstack:
+    external: true
