@@ -14,11 +14,13 @@ from ingest.csv_to_chirpstack import REQUIRED_COLUMNS, ingest_csv, validate_csv_
 
 DATA_DIR = Path(os.getenv("INGEST_DATA_DIR", "/opt/chirpstack-ingest"))
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(DATA_DIR / "uploads")))
-DB_PATH = Path(os.getenv("DB_PATH", str(DATA_DIR / "jobs.db")))
+DB_PATH = Path(os.getenv("DB_PATH", str(DATA_DIR / "data" / "jobs.db")))
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
 INGEST_API_TOKEN = os.getenv("INGEST_API_TOKEN")
 APPLICATION_ID = os.getenv("APPLICATION_ID")
 DEVICE_PROFILE_ID = os.getenv("DEVICE_PROFILE_ID") or os.getenv("LW010_PROFILE_ID")
+CHIRPSTACK_API_URL = os.getenv("CHIRPSTACK_API_URL")
+CHIRPSTACK_API_TOKEN = os.getenv("CHIRPSTACK_API_TOKEN")
 
 if not INGEST_API_TOKEN:
     raise RuntimeError("INGEST_API_TOKEN not set")
@@ -26,6 +28,10 @@ if not APPLICATION_ID:
     raise RuntimeError("APPLICATION_ID not set")
 if not DEVICE_PROFILE_ID:
     raise RuntimeError("DEVICE_PROFILE_ID (or LW010_PROFILE_ID) not set")
+if not CHIRPSTACK_API_URL:
+    raise RuntimeError("CHIRPSTACK_API_URL not set")
+if not CHIRPSTACK_API_TOKEN:
+    raise RuntimeError("CHIRPSTACK_API_TOKEN not set")
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)

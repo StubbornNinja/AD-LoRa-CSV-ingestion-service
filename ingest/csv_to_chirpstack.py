@@ -30,9 +30,7 @@ class IngestResult:
     errors: list[IngestError] = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        result = asdict(self)
-        result["errors"] = [asdict(err) for err in self.errors]
-        return result
+        return asdict(self)
 
 
 class ChirpStackClient:

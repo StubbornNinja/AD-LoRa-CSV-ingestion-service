@@ -41,7 +41,7 @@ See `.env.example` for a complete template.
 - `DEVICE_PROFILE_ID` (ChirpStack **device profile UUID**)
 - `LW010_PROFILE_ID` (legacy fallback)
 - `UPLOAD_DIR` (default `/opt/chirpstack-ingest/uploads`)
-- `DB_PATH` (default `/opt/chirpstack-ingest/jobs.db`)
+- `DB_PATH` (default `/opt/chirpstack-ingest/data/jobs.db`)
 - `MAX_UPLOAD_BYTES` (default `10485760`)
 
 ## Local Run

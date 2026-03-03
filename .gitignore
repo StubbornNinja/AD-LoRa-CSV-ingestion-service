@@ -19,9 +19,16 @@ Thumbs.db
 uploads/*.csv
 uploads/*.log
 
+# Runtime database
+data/
+jobs.db
+
 # IDE
 .vscode/
 .idea/
 
 # Old subdirectory (safety net during migration)
 chirpstack-ingest/
+
+# Development artifacts
+CGPT_Conversation.md

@@ -1,265 +1,82 @@
-Enhance the existing AD-LoRa-CSV-ingestion-service to production readiness. This includes making the CSV ingestion correct for ChirpStack LoRaWAN profiles, adding job tracking, improving API stability, containerizing the service, hardening for HTTPS exposure, and enabling future expansion (multi-profile / ABP support).
+# CODEX_PLAN.md — AD-LoRa-CSV-Ingestion-Service
 
-Scope of Work
-1) Correct Key Handling Based on Device Profile
+## Current State (as of 2026-03-03)
 
-Problem:
-The current script sends nwkKey unconditionally. ChirpStack v4 with LoRaWAN 1.0.x profiles requires appKey. Without this, device key uploads fail.
+Fixes 1-6 from the previous review cycle have been applied. The fatal Docker bugs (networking + volume mount) are resolved, ChirpStack credential validation was added, `to_dict()` was simplified, `.gitignore` was cleaned up, and a happy-path test was added.
 
-Tasks:
+**However, the happy-path test has a bug that will cause it to fail at runtime.** This was not caught because Codex could only run `py_compile` (syntax check) — `pytest` was not available in its environment.
 
-Replace hardcoded nwkKey with profile-aware logic:
+---
 
-Detect MAC version from the configured profile (via ChirpStack API).
+## REMAINING FIX — Happy-path test `AttributeError` (BUG)
 
-Use appKey for LoRaWAN 1.0.x profiles.
+**Problem:**
+In `tests/test_ingestion_api.py` line 76, the test references `module.IngestResult`:
 
-Use nwkKey for LoRaWAN 1.1 profiles.
+```python
+return_value=module.IngestResult(ok=1, skipped=0, failed=0, errors=[]),
+```
 
-Acceptance Criteria:
+`module` is `ingest.ingestion_api`, but `IngestResult` is **not imported** in that module. The import at `ingest/ingestion_api.py:13` is:
 
-Unit tests for key field selection.
+```python
+from ingest.csv_to_chirpstack import REQUIRED_COLUMNS, ingest_csv, validate_csv_headers
+```
 
-When using a LW010_PROFILE_ID, script posts {"appKey": "..."}
+`IngestResult` is not in the import list. This will raise `AttributeError: module 'ingest.ingestion_api' has no attribute 'IngestResult'` when the test runs.
 
-When using a LoRaWAN 1.1 profile, script posts {"nwkKey": "..."}
+**File:** `tests/test_ingestion_api.py`
 
-Manual CSV import via API + NGINX results in devices with correct keys in ChirpStack.
+**Fix:** Import `IngestResult` directly at the top of the test file:
 
-2) Refactor Ingest Logic to Return Structured Results
+```python
+from ingest.csv_to_chirpstack import IngestResult
+```
 
-Problem:
-Right now, the API just spawns a subprocess and returns “accepted” without results.
+Then change line 76 from:
+```python
+return_value=module.IngestResult(ok=1, skipped=0, failed=0, errors=[]),
+```
 
-Tasks:
+To:
+```python
+return_value=IngestResult(ok=1, skipped=0, failed=0, errors=[]),
+```
 
-Refactor csv_to_chirpstack.py into functions callable from Python:
+---
 
-ingest_csv(application_id, csv_path, profile_id)
+## Verification Checklist
 
-Return structured result object:
+After the fix is applied:
 
-{
-  ok: int,
-  skipped: int,
-  failed: int,
-  errors: [ ... ],
-}
+1. `pytest` — all 9 tests pass (5 csv_to_chirpstack + 4 ingestion_api including happy-path)
+2. `docker compose -f docker-compose.ingest.yml build` — image builds successfully
+3. `docker compose -f docker-compose.ingest.yml up -d` — service starts
+4. `curl http://127.0.0.1:8000/healthz` — returns `{"ok": true}`
+5. Verify `./data/jobs.db` is created as a file (not a directory) on the host
+6. Service refuses to start if `CHIRPSTACK_API_URL` or `CHIRPSTACK_API_TOKEN` are missing
 
-Acceptance Criteria:
+---
 
-Subprocess mode still works unchanged.
+## Previously Completed Items (for reference)
 
-API can import and call ingest_csv() directly without spawning a new process.
+The following items are DONE and should not be re-implemented:
 
-3) Add Job Tracking Endpoints
+1. **Correct Key Handling** — `key_field_for_mac_version()` in `csv_to_chirpstack.py` selects `appKey` for 1.0.x, `nwkKey` for 1.1. Tests verify this.
+2. **Structured Results** — `IngestResult` dataclass with `ok/skipped/failed/errors`. `ingest_csv()` is importable and callable.
+3. **Job Tracking** — SQLite schema with `jobs` table. Endpoints: `POST /upload`, `GET /jobs/{job_id}`, `GET /jobs`.
+4. **Upload Validation** — CSV-only check, header validation (BOM-safe), configurable `MAX_UPLOAD_BYTES` limit.
+5. **Containerization** — Dockerfile (`0.0.0.0` bind) and `docker-compose.ingest.yml` (directory mount for data).
+6. **Documentation** — README, `.env.example`, NGINX config example.
+7. **Startup Validation** — `CHIRPSTACK_API_URL` and `CHIRPSTACK_API_TOKEN` validated at startup (fail fast).
+8. **Security** — Bearer token auth, localhost-only Docker binding, NGINX hardening example in README.
 
-Problem:
-Clients can upload but cannot know import success or failure.
+## Future Enhancements (not blocking)
 
-Tasks:
+These remain optional and are not part of this fix cycle:
 
-Create a SQLite (or JSON) job store under /opt/chirpstack-ingest/jobs.db with schema:
-
-job_id (PK), status, created_at, started_at, finished_at, ok, skipped, failed, log_path
-
-API additions:
-
-POST /upload → creates job entry and returns job_id
-
-GET /jobs/{job_id} → returns job status + metrics
-
-GET /jobs → paginated summary
-
-Acceptance Criteria:
-
-API formal job status tracking implemented.
-
-Upload returns { job_id, status }
-
-Querying a completed job yields detailed results and links/log content.
-
-4) Improve Upload Handling & Validation
-
-Tasks:
-
-Reject non-CSV content early with 400 errors.
-
-Limit upload size (configurable but safe, e.g., 10 MB).
-
-Strong CSV header validation (required columns must be present, fail fast).
-
-Strip BOM / whitespace in headers.
-
-Acceptance Criteria:
-
-Invalid payloads return correct 4xx errors.
-
-CSV issues return structured error messages.
-
-Excessively large files are rejected (API and NGINX should both enforce).
-
-5) Containerize the API Service
-
-Goals:
-
-Dockerfile for ingestion API
-
-Integrate into ChirpStack Docker Compose stack
-
-Ensure automatic restart and network connectivity
-
-Deliverables:
-
-/ingest/Dockerfile
-
-Updated docker-compose.yml snippet
-
-Updated .env.example
-
-Volumes configured for:
-
-/uploads
-
-/jobs.db
-
-Details:
-
-Bind to 127.0.0.1:8000 so only NGINX is exposed publicly.
-
-Use restart: unless-stopped so it auto-starts after VM reboot.
-
-Docker networking allows “chirpstack” service DNS access to ChirpStack API.
-
-Acceptance Criteria:
-
-Service runs via docker compose up -d ingest-api
-
-Exposed uploads API reachable only via localhost through NGINX
-
-Logs persist between container restarts
-
-6) Update Documentation and Env Examples
-
-Tasks:
-
-Update README.md and .env.example:
-
-Clarify meaning of APPLICATION_ID (uuid vs numeric)
-
-Add INGEST_API_TOKEN
-
-Add UPLOAD_DIR, DB_PATH
-
-Show Docker Compose example
-
-Example curl usage with status endpoint
-
-Acceptance Criteria:
-
-Repository README accurately reflects production setup
-
-.env.example provides a usable starting template
-
-7) Security & Hardening
-
-Tasks:
-
-Ensure secrets are not logged (API tokens, keys)
-
-Use proper file permissions on volumes and env files
-
-NGINX must enforce:
-
-Rate limiting
-
-Request size limit
-
-TLS only
-
-Acceptance Criteria:
-
-No sensitive values in stdout/stderr logs
-
-API rejects unauthorized requests reliably
-
-System is safe for public exposure via HTTPS
-
-8) Optional Future Enhancements
-
-These are not blocking, but should be scoped if resources permit:
-
-A) Support ABP provisioning
-
-Add a CSV column like MODE, ABP, or detect if ABP fields are present
-
-Implement ABP activation logic via ChirpStack API
-
-Provide per-row provisioning strategy
-
-B) Multi-profile CSV support
-
-Allow a column like PROFILE_CODE that maps to env vars
-
-Maintain a profile mapping in config
-
-C) Dry-run API
-
-Return validation errors without writing or posting to ChirpStack
-
-Testing & Verification
-Manual Testing
-
-Upload a valid CSV via curl POST /upload with auth header.
-
-Poll GET /jobs/{job_id} until completion.
-
-Verify devices appear in ChirpStack UI with correct profiles and keys.
-
-Edge Cases
-
-Missing columns → 400 error
-
-Duplicate devices → skipped
-
-Invalid hex values → recorded as errors, job does not crash
-
-Mixed valid/invalid rows → partial success documented
-
-CI Tests (Suggested)
-
-Fixture CSVs (good, bad, mix)
-
-Unit tests for:
-
-normalize_hex()
-
-profile key selection logic
-
-API responses for bad payloads
-
-End-to-end tests with local ChirpStack test instance (Docker)
-
-Deliverable Artifacts
-
-Updated Python scripts (csv_to_chirpstack.py, ingestion_api.py)
-
-New SQLite job tracking code
-
-Dockerfile and Compose config
-
-Updated docs (README.md, CODEX_PLAN.md, .env.example)
-
-Unit tests
-
-API usage examples
-
-Milestones
-
-CSV ingest correctness & key handling
-
-API structural improvements + job tracking
-
-Containerization + Docker Compose integration
-
-Documentation + production hardening
+- ABP provisioning support
+- Multi-profile CSV support (per-row profile selection)
+- Dry-run API endpoint
+- Job cleanup / pruning of old SQLite records
+- Prometheus metrics / structured logging

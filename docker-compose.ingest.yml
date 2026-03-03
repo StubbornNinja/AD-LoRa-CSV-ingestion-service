@@ -10,7 +10,7 @@ services:
       - "127.0.0.1:8000:8000"
     volumes:
       - ./uploads:/opt/chirpstack-ingest/uploads
-      - ./jobs.db:/opt/chirpstack-ingest/jobs.db
+      - ./data:/opt/chirpstack-ingest/data
     networks:
       - chirpstack
 

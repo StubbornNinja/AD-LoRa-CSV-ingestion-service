@@ -10,8 +10,8 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY ingest /app/ingest
 
-RUN mkdir -p /opt/chirpstack-ingest/uploads && chmod 750 /opt/chirpstack-ingest /opt/chirpstack-ingest/uploads
+RUN mkdir -p /opt/chirpstack-ingest/uploads /opt/chirpstack-ingest/data && chmod 750 /opt/chirpstack-ingest /opt/chirpstack-ingest/uploads /opt/chirpstack-ingest/data
 
 EXPOSE 8000
 
-CMD ["uvicorn", "ingest.ingestion_api:app", "--host", "127.0.0.1", "--port", "8000"]
+CMD ["uvicorn", "ingest.ingestion_api:app", "--host", "0.0.0.0", "--port", "8000"]
