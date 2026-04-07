@@ -14,4 +14,4 @@ RUN mkdir -p /opt/chirpstack-ingest/uploads /opt/chirpstack-ingest/data && chmod
 
 EXPOSE 8000
 
-CMD ["uvicorn", "ingest.ingestion_api:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "ingest.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
